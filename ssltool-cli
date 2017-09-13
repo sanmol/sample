@@ -1,0 +1,1749 @@
+#!/usr/bin/perl
+
+$| = 1;
+
+# FIXME: Update authtoken storage format to handle prod/staging vs. dev
+
+use strict;
+use warnings;
+use Data::Dumper;
+use Getopt::Long qw(:config no_ignore_case no_auto_abbrev pass_through);
+use HTTP::Request::Common;
+use MIME::Base64;
+use Cwd qw(abs_path);
+use POSIX;
+
+my %CLI_ARGS = ();
+my %CONFIG = ();
+my %COLORS = ();
+my %API_OBJ = ();
+my %RESULT_OBJ = ();
+my %STATUS = ();
+
+### Script version ###
+$CONFIG{VERSION} = '0.1.54';
+
+# FIXME: If the trusted root changes (very rare) the script must be able to tell the user to download a new version of the script (set "$CONFIG{VERIFYHOSTNAME} = 0")
+
+&Load_Config;
+&Parse_Command_Line;
+if ($CONFIG{CMD} eq 'version') { print qq|Version: $CONFIG{VERSION}\n|; exit; }
+&Prepare_Environment;
+&Verify_CA_Certs;
+&Load_JSON_Module;
+
+### If we are updating the script no need to load this here ###
+if ($CONFIG{CMD} ne 'update') { &Load_External_Config; }
+
+### Select an operation ###
+CASE: {
+	&Banner;
+	($CONFIG{CMD} eq 'update') && do { &Self_Update; last CASE; };
+	($CONFIG{CMD} eq 'cabundle') && do { &API_CA_Bundle; last CASE; };
+	($CONFIG{CMD} eq 'changelog') && do { &API_Changelog; last CASE; };
+	($CONFIG{CMD} eq 'remote') && do { &API_Remote_Cert; last CASE; };
+	($CONFIG{CMD} eq 'sslwatch') && do { &API_SSLWatch; last CASE; };
+	($CONFIG{CMD} eq 'gendkim') && do { &API_Gen_DKIM; last CASE; };
+	($CONFIG{CMD} eq 'stats') && do { &API_Load_Stats; last CASE; };
+	($CONFIG{CMD} eq 'coreipaudit') && do { &API_CORE_IP_Audit; last CASE; };
+	($CONFIG{CMD} eq 'rscerts') && do { &Install_RS_Certs; last CASE; };
+	($CONFIG{CMD} =~ /(base64pkcs12topem|pkcs12topem)/) && do { &API_PKCS12_PEM; last CASE; };
+	($CONFIG{CMD} eq 'coresslcert') && do { &API_CORE_SSL_Cert; last CASE; };
+	($CONFIG{CMD} =~ /(gencsr|selfsignedcert)/) && do { &API_Gen_CSR_Self; last CASE; };
+	($CONFIG{CMD} =~ /(csrsha256|genclbjson|pemtopkcs12|pemtobase64pkcs12|pkcs7topem|removepassphrase|validate|validatecertcabundle|validatecertkey|validatecsrkey|viewcabundle|viewcert|viewcsr)/) && do { &API_View_Validate; last CASE; };
+
+	do { &Help_Menu; };
+}
+
+
+
+
+
+### UTILITY FUNCTIONS ###
+
+####################################
+##  Parse command line arguments  ##
+####################################
+sub Parse_Command_Line {
+	my %vars = ();
+
+	### Parse all arguments ###
+	$CONFIG{CMD} = shift (@ARGV);
+	if (!defined($CONFIG{CMD})) { $CONFIG{CMD} = ''; }
+	GetOptions(\%vars,'authtoken:s','b:s','c:s','cached','ccs','ciphers','clbenabled','clbport:i','clbsecure','coreaccount:s','corecertid:i','coredevice:s','curl','debug','d:s','env:s','exact','excel','failures','fullchain','friendlyname:s','genalt:s','genbits:s','genc:s','gencn:s','genemail:s','genl:s','geno:s','genou:s','genst:s','genwww','h:s','hb','htpath:s','k:s','list','location:s','newpass','p:s','pass','pkcs12:s','r:s','s:s','scanall','search:s','sort:s','tests:s','tls10','type:s','verbose','v');
+
+	### Generate an error if an unknown argument was submitted ###
+	if (scalar(@ARGV)) { &Bail('Unknown argument(s) submitted. ("' . join('", "', @ARGV) . '")'); }
+
+	### Global ###
+	$CONFIG{VERBOSE} = ( (defined($vars{v})) || (defined($vars{verbose})) ) ? 1 : 0;
+	$CONFIG{DEBUG} = (defined($vars{debug}))? 1 : 0;
+	$CONFIG{PRINTCURL} = (defined($vars{curl})) ? 1 : 0;
+	$CONFIG{FULLCHAIN} = (defined($vars{fullchain})) ? 1 : 0;
+	if ($CONFIG{VERBOSE}) { $CONFIG{PRINTCURL} = 1; }
+	$CONFIG{IDENTITYTOKEN} = (defined($vars{authtoken})) ? $vars{authtoken} : '';
+
+	### Environment ###
+	if (defined($vars{env})) { $CONFIG{ENV} = $vars{env}; }
+	if (!defined($CONFIG{URLS}{API}{$CONFIG{ENV}})) { &Bail(qq|Unknown environment. ($CONFIG{ENV})|); };
+	$CONFIG{APIURL} = $CONFIG{URLS}{API}{$CONFIG{ENV}};
+	$CONFIG{GUIURL} = $CONFIG{URLS}{GUI}{$CONFIG{ENV}};
+
+	### CLI source URIs ###
+	$CONFIG{CLI_URL} = $CONFIG{GUIURL} . '/cli/ssltool-cli';
+	$CONFIG{CONF_URL} = $CONFIG{GUIURL} . '/webconfig.json';
+
+	### URI of JSON Perl module ###
+	$CONFIG{JSON_MOD_URL} = $CONFIG{GUIURL} . '/cli/Tiny.pm';
+
+	### URI of RS CA crtificates ###
+	$CONFIG{RSCERTS_URL} = $CONFIG{GUIURL} . '/rscerts';
+
+	### Hammertime ###
+	$CLI_ARGS{HTPATH} = (defined($vars{htpath})) ? $vars{htpath} : qx|which ht 2>/dev/null|;
+	if ($CLI_ARGS{HTPATH} ne '') { chomp $CLI_ARGS{HTPATH}; }
+
+	### View/validate/convert ###
+	$CLI_ARGS{CERTIFICATE} = (defined($vars{c})) ? $vars{c} : '';
+	$CLI_ARGS{CSR} = (defined($vars{r})) ? $vars{r} : '';
+	$CLI_ARGS{HOST} = (defined($vars{h})) ? $vars{h} : '';
+	$CLI_ARGS{PORT} = (defined($vars{p})) ? $vars{p} : '';
+	$CLI_ARGS{CACHED} = (defined($vars{cached})) ? 1 : 0;
+	$CLI_ARGS{CABUNDLE} = (defined($vars{b})) ? $vars{b} : '';
+	$CLI_ARGS{KEY} = (defined($vars{k})) ? $vars{k} : '';
+	$CLI_ARGS{SERVERNAME} = (defined($vars{s})) ? $vars{s} : '';
+	$CLI_ARGS{TLS10} = (defined($vars{tls10})) ? 1 : 0;
+	$CLI_ARGS{PKCS12FILE} = (defined($vars{pkcs12})) ? $vars{pkcs12} : '';
+	$CLI_ARGS{FRIENDLYNAME} = (defined($vars{friendlyname})) ? $vars{friendlyname} : '';
+	if (defined($vars{pass})) {
+		print 'Please enter the current passphrase: ';
+		chomp ($CLI_ARGS{PASSPHRASE} = <STDIN>);
+	} else {
+		$CLI_ARGS{PASSPHRASE} = '';
+	}
+	if (defined($vars{newpass})) {
+		print 'Please enter the new passphrase: ';
+		chomp ($CLI_ARGS{NEWPASSPHRASE} = <STDIN>);
+	} else {
+		$CLI_ARGS{NEWPASSPHRASE} = '';
+	}
+
+	### DKIM ###
+	$CLI_ARGS{DOMAIN} = (defined($vars{d})) ? $vars{d} : '';
+
+	### SSLWatch ###
+	$CLI_ARGS{SSLWATCH}{SEARCH} = (defined($vars{search})) ? $vars{search} : '';
+	$CLI_ARGS{SSLWATCH}{TESTS} = (defined($vars{tests})) ? $vars{tests} : '';
+	$CLI_ARGS{SSLWATCH}{LOCATION} = (defined($vars{location})) ? $vars{location} : 'internal';
+	$CLI_ARGS{SSLWATCH}{TYPE} = (defined($vars{type})) ? $vars{type} : 'expired';
+	$CLI_ARGS{SSLWATCH}{SORT} = (defined($vars{sort})) ? $vars{sort} : 'expiration';
+	$CLI_ARGS{SSLWATCH}{FAILURES} = (defined($vars{failures})) ? 1 : 0;
+	$CLI_ARGS{SSLWATCH}{LIST} = (defined($vars{list})) ? 1 : 0;
+	$CLI_ARGS{SSLWATCH}{EXACT} = (defined($vars{exact})) ? 1 : 0;
+	$CLI_ARGS{SSLWATCH}{EXCEL} = (defined($vars{excel})) ? 1 : 0;
+
+	### CORE ###
+	$CLI_ARGS{CORE}{CERTID} = (defined($vars{corecertid})) ? $vars{corecertid} : '';
+	$CLI_ARGS{CORE}{ACCOUNT} = (defined($vars{coreaccount})) ? $vars{coreaccount} : '';
+	$CLI_ARGS{CORE}{DEVICE} = (defined($vars{coredevice})) ? $vars{coredevice} : '';
+
+	### Generate CSR/self-signed ###
+	$CLI_ARGS{GENERATE}{cn} = (defined($vars{gencn})) ? $vars{gencn} : '';
+	$CLI_ARGS{GENERATE}{o} = (defined($vars{geno})) ? $vars{geno} : '';
+	$CLI_ARGS{GENERATE}{l} = (defined($vars{genl})) ? $vars{genl} : '';
+	$CLI_ARGS{GENERATE}{st} = (defined($vars{genst})) ? $vars{genst} : '';
+	$CLI_ARGS{GENERATE}{c} = (defined($vars{genc})) ? $vars{genc} : '';
+	$CLI_ARGS{GENERATE}{alt} = (defined($vars{genalt})) ? $vars{genalt} : '';
+	$CLI_ARGS{GENERATE}{email} = (defined($vars{genemail})) ? $vars{genemail} : '';
+	$CLI_ARGS{GENERATE}{ou} = (defined($vars{genou})) ? $vars{genou} : '';
+	$CLI_ARGS{GENERATE}{www} = (defined($vars{genwww})) ? 1 : 0;
+	$CLI_ARGS{GENERATE}{bits} = (defined($vars{genbits})) ? $vars{genbits} : 'rsa2048';
+
+	### Extended SSL scan ###
+	if (defined($vars{scanall})) {
+		$CLI_ARGS{HEARTBLEED} = 1;
+		$CLI_ARGS{OPENSSLCCS} = 1;
+		$CLI_ARGS{CIPHERS} = 1;
+	} else {
+		$CLI_ARGS{HEARTBLEED} = (defined($vars{hb})) ? 1 : 0;
+		$CLI_ARGS{OPENSSLCCS} = (defined($vars{ccs})) ? 1 : 0;
+		$CLI_ARGS{CIPHERS} = (defined($vars{ciphers})) ? 1 : 0;
+	}
+
+	### CLB JSON ###
+	$CLI_ARGS{CLB}{ENABLED} = (defined($vars{clbenabled})) ? 1 : 0;
+	$CLI_ARGS{CLB}{SECURE} = (defined($vars{clbsecure})) ? 1 : 0;
+	$CLI_ARGS{CLB}{PORT} = (defined($vars{clbport})) ? $vars{clbport} : '';
+}
+
+
+#######################
+##  Print help menu  ##
+#######################
+sub Help_Menu {
+
+	print <<EOF;
+
+Usage: ssltool-cli <COMMAND> <ARGS>
+
+The SSLTool API requires an Identity token as an authentication mechanism. This script will attempt to find an Identity token in either Chrome or Firefox (you will have to access either SSLTool or Encore in a web browser), or you can use the "--authtoken" flag.
+
+Any command that can take a private key as an argument can also accept the "--pass" argument to allow the use of a passphrase (you will be prompted for the passphrase).
+
+Any command that processes more than a single certificate (e.g., "remotecert", PKCS functions, etc.) can also accept the "--fullchain" argument to display the contents of the entire certificate chain.
+
+Basic flags:
+$CONFIG{ARGMAP}{verbose}$CONFIG{ARGMAP}{curl}$CONFIG{ARGMAP}{env}
+Available commands:
+
+EOF
+	foreach my $o ('rscerts','stats','version','update') {
+		printf ("$COLORS{green}%-30s$COLORS{reset}%s\n", $o, $CONFIG{apicmd}{$o}{desc});
+	}
+
+	print qq|\n|;
+
+	foreach my $o (sort {$a cmp $b} keys %{$CONFIG{apicmd}}) {
+		if (defined ($CONFIG{apicmd}{$o}{args})) {
+			printf ("$COLORS{green}%-30s$COLORS{reset}%s\n%s\n", $o, $CONFIG{apicmd}{$o}{desc}, $CONFIG{apicmd}{$o}{args});
+		}
+	}
+
+	my $i = 0;
+	my $count = scalar(keys %{$CONFIG{config}{failabletests}});
+	my $split = int( scalar(keys %{$CONFIG{config}{failabletests}}) / 3 );
+	my $failable = '';
+
+	foreach my $t (sort keys %{$CONFIG{config}{failabletests}}) {
+		if ($i % $split == 0) { $failable .= qq|\n| . ' ' x 42; }
+		$failable .= qq|$t, |;
+		$i++;
+	}
+	chop $failable;
+
+	print qq|The "sslwatch" command requires a number of additional arguments (these are grouped by function):\n\n|;
+	printf ("$COLORS{green}%-30s$COLORS{reset}%s\n", 'sslwatch', $CONFIG{apicmd}{sslwatch}{desc});
+	printf ("  %-35s%s\n", '--search <SEARCHTERM>','Search for a certificate with a Common Name that contains the string "searchterm"');
+	printf ("  %-35s%s\n", '  --exact','Display exact matches only');
+	print qq|\n|;
+	printf ("  %-35s%s\n", '--excel','Generate Excel spreadsheet of internal SSL issues');
+	print qq|\n|;
+	printf ("  %-35s%s\n", '--list','List all entries in the database that match the following filters');
+	printf ("  %-35s%s\n", '  --location internal','Rackspace-owned (default)');
+	printf ("  %-35s%s\n", '             external','Customer-owned');
+	printf ("  %-35s%s\n", '  --type expired','Certificate has already expired (default)');
+	printf ("  %-35s%s\n", '         expiring','Certificate will expire in the next 60 days');
+	printf ("  %-35s%s\n", '         error','Certificate has installation errors');
+	printf ("  %-35s%s\n", '         unresponsive','Certificate is currently unreachable');
+	printf ("  %-35s%s\n", '  --sort expiration','Sort by expiration date (default)');
+	printf ("  %-35s%s\n", '         hn','Sort by hostname');
+	print qq|\n|;
+	printf ("  %-35s%s\n", '--failures','List all entries in the database that match the following test failures');
+	printf ("  %-35s%s\n", '  --location internal','Rackspace-owned (default)');
+	printf ("  %-35s%s\n", '             external','Customer-owned');
+	printf ("  %-35s%s\n", '  --tests "xxxxx"','Comma-delimited list of tests (choose at least 1):' . $failable);
+
+
+	print qq|\nThe "gencsr" and "selfsignedcert" commands use the same arguments:\n\n|;
+
+	printf ("$COLORS{green}%-30s$COLORS{reset}%s\n", 'gencsr', $CONFIG{apicmd}{gencsr}{desc});
+	printf ("$COLORS{green}%-30s$COLORS{reset}%s\n", 'selfsignedcert', $CONFIG{apicmd}{selfsignedcert}{desc});
+	print qq|\nRequired arguments:\n|;
+
+	printf ("  %-35s%s\n", '  --gencn','Common name');
+	printf ("  %-35s%s\n", '  --geno','Organization');
+	printf ("  %-35s%s\n", '  --genl','Locatity (city)');
+	printf ("  %-35s%s\n", '  --genst','State');
+	printf ("  %-35s%s\n", '  --genc','Country');
+
+	print qq|\nOptional arguments:\n|;
+
+	printf ("  %-35s%s\n", '  --genalt','Subject alternative names (comma separated)');
+	printf ("  %-35s%s\n", '  --genemail','Email address');
+	printf ("  %-35s%s\n", '  --genou','Organizational unit');
+	printf ("  %-35s%s\n", '  --genwww','Include "www" and "non-www" versions');
+	printf ("  %-35s%s\n", '  --genbits rsa2048','2048-bit RSA private key (default)');
+	printf ("  %-35s%s\n", '            rsa4096','4096-bit RSA private key');
+	printf ("  %-35s%s\n", '            prime256v1','ECDSA key using group P-256 (available for CSRs only)');
+	printf ("  %-35s%s\n", '            secp384r1','ECDSA key using group P-384 (available for CSRs only)');
+}
+
+
+#############################
+##  Print horizontal line  ##
+#############################
+sub HR {
+	print '-' x 90 . "\n";
+}
+
+
+############################
+##  Print section header  ##
+############################
+sub Print_Header {
+	my $msg = shift;
+	print qq|$COLORS{light}$msg$COLORS{reset}\n|;
+	&HR;
+}
+
+
+######################################################
+##  Determine if we are running the latest version  ##
+######################################################
+sub Check_Version {
+	if ( (!defined($RESULT_OBJ{ssltool}{cli_version})) || ($CONFIG{VERSIONCHECK} == 1) ) { return; }
+
+	my $ver = $RESULT_OBJ{ssltool}{cli_version};
+
+	### Don't alert for old version if we are actually updating it ###
+	if ($CONFIG{CMD} eq 'update') { return; }
+
+	### Basic version function ###
+	sub _version {
+		my $v = shift;
+		my ($a,$b,$c) = split(/\./,$v);
+		my $ver = $a*10**6 + $b*10**3 + $c;
+		return $ver;
+	}
+
+	if ( &_version($CONFIG{VERSION}) < &_version($ver) ) {
+		print qq|\n$COLORS{bluerev}An updated version of ssltool-cli is available. (Latest is version $ver.)$COLORS{reset}\n|;
+		print qq|\n$COLORS{bluerev}Run "|;
+
+		### If the user does not own the file then suggest using sudo ###
+		my $file_uid = (stat $CONFIG{MYPATH})[4];
+		my $user_uid = $>;
+		if ($file_uid != $user_uid) { if ($user_uid != 0) { print 'sudo '; } }
+
+		print qq|$CONFIG{MYPATH} update" to download the latest version.$COLORS{reset}\n\n|;
+		&HR;
+	}
+	$CONFIG{VERSIONCHECK} = 1;
+}
+
+
+################################
+##  Set configuration values  ##
+################################
+sub Load_Config {
+	### Escape codes for text colors ###
+	$COLORS{red} = "\e[1;31m";
+	$COLORS{green} = "\e[1;32m";
+	$COLORS{yellow}= "\e[1;33m";
+	$COLORS{blue} = "\e[1;34m";
+	$COLORS{light} = "\e[1m";
+	$COLORS{violet} = "\e[1;35m";
+	$COLORS{reset} = "\e[0m";
+
+	### Filesystem paths ###
+	$CONFIG{HOME} = $ENV{"HOME"};
+	$CONFIG{WORKINGDIR} = $CONFIG{HOME} . '/.config/ssltool';
+	$CONFIG{JSON_MOD_FILE} = qq|$CONFIG{WORKINGDIR}/Tiny.pm|;
+	$CONFIG{CACERT_FILE} = qq|$CONFIG{WORKINGDIR}/cacert.pem|;
+	$CONFIG{CONF_FILE} = qq|$CONFIG{WORKINGDIR}/webconfig.json|;
+	$CONFIG{TOKEN_FILE} = qq|$CONFIG{WORKINGDIR}/authtoken|;
+
+	### Various status configs ###
+	$CONFIG{VERSIONCHECK} = 0;
+	$CONFIG{VERIFYHOSTNAME} = 1;
+
+	### Contact email ###
+	$CONFIG{CONTACT} = 'ssltool@rackspace.com';
+
+	### Default API environment ###
+	$CONFIG{ENV} = 'prod';
+
+	$CONFIG{URLS}{API}{dev} = 'https://devel-api.ssltool.rackspace.com';
+	$CONFIG{URLS}{GUI}{dev} = 'https://devel.ssltool.rackspace.com';
+	$CONFIG{URLS}{API}{staging} = 'https://staging-api.ssltool.rackspace.com';
+	$CONFIG{URLS}{GUI}{staging} = 'https://staging.ssltool.rackspace.com';
+	$CONFIG{URLS}{API}{prod} = 'https://api.ssltool.rackspace.com';
+	$CONFIG{URLS}{GUI}{prod} = 'https://ssltool.rackspace.com';
+
+	### Track whether or not we have an identity token ###
+	$CONFIG{TOKEN_FOUND} = 0;
+
+	### Path to this script ###
+	$CONFIG{MYPATH} = abs_path(__FILE__);
+
+	### Escape codes for text colors ###
+	$COLORS{red} = "\e[1;31m";
+	$COLORS{green} = "\e[1;32m";
+	$COLORS{yellow}= "\e[1;33m";
+	$COLORS{blue} = "\e[1;34m";
+	$COLORS{light} = "\e[1m";
+	$COLORS{violet} = "\e[1;35m";
+	$COLORS{reset} = "\e[0m";
+
+	$COLORS{whiterev}= "\e[1;47m";
+	$COLORS{goldrev} = "\033[48;5;220m";
+	$COLORS{bluerev} = "\e[1;37;44m";
+
+	$COLORS{yellowwarn} = "\e[1;33;7m";
+	$COLORS{redwarn} = "\e[1;31;7m";
+
+	### Set colors for test statuses ###
+	$STATUS{success} = { 'color' => $COLORS{green}, 'code' => 'S' };
+	$STATUS{informational} = { 'color' => $COLORS{blue}, 'code' => 'I' };
+	$STATUS{warning} = { 'color' => $COLORS{yellow}, 'code' => 'W' };
+	$STATUS{failure} = { 'color' => $COLORS{red}, 'code' => 'F' };
+	$STATUS{unknown} = { 'color' => $COLORS{violet}, 'code' => 'U' };
+	for my $s (keys %STATUS) { $STATUS{$s}{code} = qq|[$STATUS{$s}{color}$STATUS{$s}{code}$COLORS{reset}]|; }
+	$STATUS{audit_avail} = { 'color' => $STATUS{success}{color}, 'code' => 'Avail' };
+	$STATUS{audit_unk} = { 'color' => $STATUS{unknown}{color}, 'code' => 'Unknown' };
+	$STATUS{audit_exp} = { 'color' => $STATUS{failure}{color}, 'code' => 'Expired' };
+	$STATUS{audit_inuse} = { 'color' => $COLORS{reset}, 'code' => 'In Use' };
+
+	### Description of arguments ###
+	$CONFIG{ARGMAP}{b64pkcs12} = sprintf ("  %-35s%s\n", '--pkcs12 <PKCS_FILE>','Path to base64 PKCS file');
+	$CONFIG{ARGMAP}{bundle} = sprintf ("  %-35s%s\n", '-b <BUNDLE_FILE>','Path to CA bundle file');
+	$CONFIG{ARGMAP}{cached} = sprintf ("  %-35s%s\n", '--cached','Attempt to load a cached version of the results if available (faster, less load generated, but slightly out of date)');
+	$CONFIG{ARGMAP}{ccs} = sprintf ("  %-35s%s\n", '--ccs','Check for vulnerability to OpenSSL Change Cipher Spec CVE-2014-0224 (optional)');
+	$CONFIG{ARGMAP}{cert} = sprintf ("  %-35s%s\n", '-c <CERTIFICATE_FILE>','Path to certificate file');
+	$CONFIG{ARGMAP}{ciphers} = sprintf ("  %-35s%s\n", '--ciphers','Scan for available ciphers (optional)');
+	$CONFIG{ARGMAP}{clbenabled} = sprintf ("  %-35s%s\n", '--clbenabled','Enable loadbalancer');
+	$CONFIG{ARGMAP}{clbport} = sprintf ("  %-35s%s\n", '--clbport <PORT>','Port number for loadbalancer');
+	$CONFIG{ARGMAP}{clbsecure} = sprintf ("  %-35s%s\n", '--clbsecure','Secure traffic only');
+	$CONFIG{ARGMAP}{coreaccount} = sprintf ("  %-35s%s\n", '--coreaccount <ACCOUNTID>','CORE account number');
+	$CONFIG{ARGMAP}{corecertid} = sprintf ("  %-35s%s\n", '--corecertid <CERTIFICATEID>','CORE SSL certificate ID');
+	$CONFIG{ARGMAP}{coredevice} = sprintf ("  %-35s%s\n", '--coredevice <DEVICEID>','CORE device number');
+	$CONFIG{ARGMAP}{htpath} = sprintf ("  %-35s%s\n", '--htpath /path/to/ht','Path to Hammertime binary (if it is not able to be autodetected');
+	$CONFIG{ARGMAP}{csr} = sprintf ("  %-35s%s\n", '-r <CSR_FILE>','Path to CSR file');
+	$CONFIG{ARGMAP}{curl} = sprintf ("  %-35s%s\n", '--curl','Print equivalent cURL command');
+	$CONFIG{ARGMAP}{domain} = sprintf ("  %-35s%s\n", '-d <DOMAIN>','Domain to use');
+	$CONFIG{ARGMAP}{env} = sprintf ("  %-35s%s\n", '--env [dev|staging|prod]','Use specific SSLTool API environment (defaults to "prod")');
+	$CONFIG{ARGMAP}{heartbleed} = sprintf ("  %-35s%s\n", '--hb','Check for vulnerability to HeartBleed (optional)');
+	$CONFIG{ARGMAP}{host} = sprintf ("  %-35s%s\n", '-h <HOSTNAME>','Hostname or IP to connect to (required)');
+	$CONFIG{ARGMAP}{key} = sprintf ("  %-35s%s\n", '-k <KEY_FILE>','Path to private key file');
+	$CONFIG{ARGMAP}{pass} = sprintf ("  %-35s%s\n", '--pass','Prompt for a passphrase');
+	$CONFIG{ARGMAP}{pkcs12} = sprintf ("  %-35s%s\n", '--pkcs12 <PKCS_FILE>','Path to PKCS file');
+	$CONFIG{ARGMAP}{port} = sprintf ("  %-35s%s\n", '-p <PORT>','Port to connect to (optional: defaults to port 443)');
+	$CONFIG{ARGMAP}{servername} = sprintf ("  %-35s%s\n", '-s <SERVERNAME>','Servername to use (optional: defaults to <HOSTNAME>)');
+	$CONFIG{ARGMAP}{scanall} = sprintf ("  %-35s%s\n", '--scanall','Enable --ccs, --ciphers, and --hb');
+	$CONFIG{ARGMAP}{tls10} = sprintf ("  %-35s%s\n", '--tls10','Restrict connections to TLSv1.0 or lower');
+	$CONFIG{ARGMAP}{verbose} = sprintf ("  %-35s%s\n", '-v|--verbose','Verbose mode (also enables --curl)');
+
+	### Descriptions of commands ###
+	$CONFIG{apicmd}{version}{desc} = 'Print the utility version';
+	$CONFIG{apicmd}{update}{desc} = 'Update to latest version';
+	$CONFIG{apicmd}{stats}{desc} = 'Display SSLTool usage statistics';
+	$CONFIG{apicmd}{rscerts}{desc} = 'Install Rackspace root CA certificates';
+	$CONFIG{apicmd}{sslwatch}{desc} = 'Interact with the SSLWatch database';
+	$CONFIG{apicmd}{gencsr}{desc} = 'Create a CSR';
+	$CONFIG{apicmd}{selfsignedcert}{desc} = 'Create a self-signed certificate';
+
+	$CONFIG{apicmd}{coreipaudit}{desc} = 'Audit IPs from a CORE account or device';
+	$CONFIG{apicmd}{coreipaudit}{args} = qq|  Choose one of the following:\n| . $CONFIG{ARGMAP}{coreaccount} . $CONFIG{ARGMAP}{coredevice};
+	$CONFIG{apicmd}{base64pkcs12topem}{desc} = 'Convert a base64-formatted PKCS #12 certificate to PEM';
+	$CONFIG{apicmd}{base64pkcs12topem}{args} = $CONFIG{ARGMAP}{b64pkcs12};
+	$CONFIG{apicmd}{cabundle}{desc} = 'Return the CA bundle that was used to sign this certificate';
+	$CONFIG{apicmd}{cabundle}{args} = $CONFIG{ARGMAP}{cert};
+	$CONFIG{apicmd}{coresslcert}{desc} = 'Retrieve the certificate, private key, and CA bundle for a certificate ordered in CORE';
+	$CONFIG{apicmd}{coresslcert}{args} = $CONFIG{ARGMAP}{corecertid} . qq|  Optional flag; upload certificate files to a CORE device (Linux devices only) using Hammertime:\n| . $CONFIG{ARGMAP}{coredevice};
+	$CONFIG{apicmd}{csrsha256}{desc} = 'Generate SHA256 CSR from existing CSR';
+	$CONFIG{apicmd}{csrsha256}{args} = $CONFIG{ARGMAP}{csr};
+	$CONFIG{apicmd}{genclbjson}{desc} = 'Create JSON object from certificate, key and bundle';
+	$CONFIG{apicmd}{genclbjson}{args} = $CONFIG{ARGMAP}{bundle} . $CONFIG{ARGMAP}{cert} . $CONFIG{ARGMAP}{key} . $CONFIG{ARGMAP}{clbport} . qq|  Optional arguments:\n| . $CONFIG{ARGMAP}{clbenabled} . $CONFIG{ARGMAP}{clbsecure};
+	$CONFIG{apicmd}{gendkim}{desc} = 'Generate DKIM for a domain';
+	$CONFIG{apicmd}{gendkim}{args} = $CONFIG{ARGMAP}{domain};
+	$CONFIG{apicmd}{pemtobase64pkcs12}{desc} = 'Convert a PEM certificate and key to base64-formatted PKCS #12';
+	$CONFIG{apicmd}{pemtobase64pkcs12}{args} = $CONFIG{ARGMAP}{cert} . $CONFIG{ARGMAP}{key} . qq|  Optional arguments:\n| . $CONFIG{ARGMAP}{bundle};
+	$CONFIG{apicmd}{pemtopkcs12}{desc} = 'Convert a PEM certificate and key to PKCS #12';
+	$CONFIG{apicmd}{pemtopkcs12}{args} = $CONFIG{ARGMAP}{cert} . $CONFIG{ARGMAP}{key} . qq|  Optional arguments:\n| . $CONFIG{ARGMAP}{bundle};
+	$CONFIG{apicmd}{pkcs12topem}{desc} = 'Convert a PKCS #12 certificate to PEM';
+	$CONFIG{apicmd}{pkcs12topem}{args} = $CONFIG{ARGMAP}{pkcs12};
+	$CONFIG{apicmd}{pkcs7topem}{desc} = 'Convert a PKCS #7 certificate to PEM';
+	$CONFIG{apicmd}{pkcs7topem}{args} = $CONFIG{ARGMAP}{cert};
+	$CONFIG{apicmd}{remote}{desc} = 'Examine a remote server and service';
+	$CONFIG{apicmd}{remote}{args} = $CONFIG{ARGMAP}{host} . $CONFIG{ARGMAP}{port} . $CONFIG{ARGMAP}{servername} . qq|  Optional arguments:\n| . $CONFIG{ARGMAP}{cached} . $CONFIG{ARGMAP}{ccs} . $CONFIG{ARGMAP}{ciphers} . $CONFIG{ARGMAP}{heartbleed} . $CONFIG{ARGMAP}{scanall} . $CONFIG{ARGMAP}{tls10};
+	$CONFIG{apicmd}{removepassphrase}{desc} = 'Remove a passphrase from a private key';
+	$CONFIG{apicmd}{removepassphrase}{args} = $CONFIG{ARGMAP}{key} . $CONFIG{ARGMAP}{pass};
+	$CONFIG{apicmd}{validatecertcabundle}{desc} = 'Validate a certificate and CA bundle';
+	$CONFIG{apicmd}{validatecertcabundle}{args} = $CONFIG{ARGMAP}{cert} . $CONFIG{ARGMAP}{bundle};
+	$CONFIG{apicmd}{validatecertkey}{desc} = 'Validate a certificate and private key';
+	$CONFIG{apicmd}{validatecertkey}{args} = $CONFIG{ARGMAP}{cert} . $CONFIG{ARGMAP}{key};
+	$CONFIG{apicmd}{validatecsrkey}{desc} = 'Validate a CSR and private key';
+	$CONFIG{apicmd}{validatecsrkey}{args} = $CONFIG{ARGMAP}{key} . $CONFIG{ARGMAP}{csr};
+	$CONFIG{apicmd}{validate}{desc} = 'Combined validation function';
+	$CONFIG{apicmd}{validate}{args} = $CONFIG{ARGMAP}{cert} . $CONFIG{ARGMAP}{key} . $CONFIG{ARGMAP}{csr} . $CONFIG{ARGMAP}{bundle};
+	$CONFIG{apicmd}{viewcabundle}{desc} = 'View the contents of a CA bundle';
+	$CONFIG{apicmd}{viewcabundle}{args} = $CONFIG{ARGMAP}{bundle};
+	$CONFIG{apicmd}{viewcert}{desc} = 'Print the contents of a certificate';
+	$CONFIG{apicmd}{viewcert}{args} = $CONFIG{ARGMAP}{cert};
+	$CONFIG{apicmd}{viewcsr}{desc} = 'Print the contents of a CSR';
+	$CONFIG{apicmd}{viewcsr}{args} = $CONFIG{ARGMAP}{csr};
+
+	### Cipher strength colors ###
+	$CONFIG{strength}{weak} = 'red';
+	$CONFIG{strength}{medium} = 'yellow';
+	$CONFIG{strength}{strong} = 'green';
+
+	### Path to Hammertime config ##
+	$CONFIG{htconfig} = qq|$CONFIG{HOME}/.hammertime/cache/session|;
+}
+
+
+################################
+##  Print out opening banner  ##
+################################
+sub Banner {
+	my $output = '';
+	$output .= qq|    $COLORS{whiterev}       $COLORS{reset}  | . qq|    $COLORS{red}██████$COLORS{reset}╗ $COLORS{red}██████$COLORS{reset}╗$COLORS{red}██$COLORS{reset}╗  $COLORS{red}████████$COLORS{reset}╗               $COLORS{red}██$COLORS{reset}╗   $COLORS{red}██████$COLORS{reset}╗$COLORS{red}██$COLORS{reset}╗     $COLORS{red}██████$COLORS{reset}╗| . "\n";
+	$output .= qq|   $COLORS{whiterev}  $COLORS{reset}     $COLORS{whiterev}  $COLORS{reset} | . qq|   $COLORS{red}██$COLORS{reset}╔════╝$COLORS{red}██$COLORS{reset}╔════╝$COLORS{red}██$COLORS{reset}║  ╚══$COLORS{red}██$COLORS{reset}╔══╝$COLORS{red}█████$COLORS{reset}╗  $COLORS{red}█████$COLORS{reset}╗ $COLORS{red}██$COLORS{reset}║  $COLORS{red}██$COLORS{reset}╔════╝$COLORS{red}██$COLORS{reset}║     ╚═$COLORS{red}██$COLORS{reset}╔═╝| . "\n";
+	$output .= qq|   $COLORS{whiterev}  $COLORS{reset}     $COLORS{whiterev}  $COLORS{reset} | . qq|   ╚$COLORS{red}█████$COLORS{reset}╗ ╚$COLORS{red}█████$COLORS{reset}╗ $COLORS{red}██$COLORS{reset}║     $COLORS{red}██$COLORS{reset}║  $COLORS{red}██$COLORS{reset}╔══$COLORS{red}██$COLORS{reset}╗$COLORS{red}██$COLORS{reset}╔══$COLORS{red}██$COLORS{reset}╗$COLORS{red}██$COLORS{reset}║  $COLORS{red}██$COLORS{reset}║     $COLORS{red}██$COLORS{reset}║       $COLORS{red}██$COLORS{reset}║| . "\n";
+	$output .= qq|  $COLORS{goldrev}           $COLORS{reset}| . qq|    ╚═══$COLORS{red}██$COLORS{reset}╗ ╚═══$COLORS{red}██$COLORS{reset}╗$COLORS{red}██$COLORS{reset}║     $COLORS{red}██$COLORS{reset}║  $COLORS{red}██$COLORS{reset}║  $COLORS{red}██$COLORS{reset}║$COLORS{red}██$COLORS{reset}║  $COLORS{red}██$COLORS{reset}║$COLORS{red}██$COLORS{reset}║  $COLORS{red}██$COLORS{reset}║     $COLORS{red}██$COLORS{reset}║       $COLORS{red}██$COLORS{reset}║| . "\n";
+	$output .= qq|  $COLORS{goldrev}           $COLORS{reset}| . qq|   $COLORS{red}██████$COLORS{reset}╔╝$COLORS{red}██████$COLORS{reset}╔╝$COLORS{red}███████$COLORS{reset}╗$COLORS{red}██$COLORS{reset}║  ╚$COLORS{red}█████$COLORS{reset}╔╝╚$COLORS{red}█████$COLORS{reset}╔╝$COLORS{red}██$COLORS{reset}║  ╚$COLORS{red}██████$COLORS{reset}╗$COLORS{red}███████$COLORS{reset}╗$COLORS{red}██████$COLORS{reset}╗| . "\n";
+	$output .= qq|  $COLORS{goldrev}           $COLORS{reset}| . qq|   ╚═════╝ ╚═════╝ ╚══════╝╚═╝   ╚════╝  ╚════╝ ╚═╝   ╚═════╝╚══════╝╚═════╝| . "\n";
+	&HR;
+	print qq|$output                              version $CONFIG{VERSION} -- $CONFIG{CONTACT}\n|;
+	&HR;
+
+	if (defined($CONFIG{apicmd}{$CONFIG{CMD}}{desc})) { &Print_Header(qq|API Command "$CONFIG{CMD}" -- $CONFIG{apicmd}{$CONFIG{CMD}}{desc}|); }
+}
+
+
+###################################
+##  Print failure/error message  ##
+###################################
+sub Bail {
+	my $msg = shift;
+	my $l = length $msg;
+	$l += 10;
+	print "\n";
+	print '#' x $l . "\n";
+	print '#' x 3 . ' ' x ($l-6) . '#' x 3 . "\n";
+	print '###  ' . $msg . '  ###' . "\n";
+	print '#' x 3 . ' ' x ($l-6) . '#' x 3 . "\n";
+	print '#' x $l . "\n";
+	exit;
+}
+
+
+##################################################
+##  Print out status message from test restuls  ##
+##################################################
+sub Print_Test_Status {
+	my ($t,$s,$d) = @_;
+	my $output = '';
+
+	$output .= $STATUS{$s}{color} . sprintf ("%17s", $t) . qq|$COLORS{reset} $STATUS{$s}{code}: $d\n|;
+
+	print $output;
+}
+
+
+###########################################
+##  Print certificate chain information  ##
+###########################################
+sub Print_Certificate_Chain {
+	if ( (defined($RESULT_OBJ{chain})) && (defined($RESULT_OBJ{chain}{0})) ) {
+		if (defined($RESULT_OBJ{chain}{0}{csr})) {
+			&Print_Header(qq|CSR information:|);
+		} else {
+			&Print_Header(qq|Certificate information:|);
+		}
+	}
+
+	### Determine if we should print just the main certificate or the entire chain ###
+	if (defined($RESULT_OBJ{chain})) {
+		my $limit = ( ($CONFIG{CMD} eq 'viewcabundle') || ($CONFIG{FULLCHAIN}) ) ? $RESULT_OBJ{chain}{info}{length} : 1;
+		for (my $i=0; $i<$limit; $i++) { &Print_Certificate_Information(\%{$RESULT_OBJ{$i}{data}}); }
+	}
+
+	### Display link to correct CA bundle if necessary ###
+	if ( (defined($RESULT_OBJ{chain})) && (defined($RESULT_OBJ{chain}{correctbundle})) ) {
+		if (defined($RESULT_OBJ{chain}{correctbundle}{error})) {
+			&Print_Header('Unable to find a matching CA bundle.');
+		} else {
+			&Print_Header(qq|The correct CA bundle for this certificate can be found at $COLORS{bluerev}$RESULT_OBJ{chain}{correctbundle}{url}$COLORS{reset}|);
+		}
+	}
+
+	### Display certificate test results ###
+	if (defined($RESULT_OBJ{chain}{testresults})) {
+		my $message .= ($CONFIG{CMD} =~ /csr/) ? qq|CSR| : qq|Certificate chain|;
+		print qq|$COLORS{light}$message test results:$COLORS{reset}\n|;
+
+		my $legend = '';
+		foreach my $s ('success','warning','failure','informational','unknown') {
+			my $x = $s;
+			substr($x, 0, 1, '');
+			$legend .= qq|$STATUS{$s}{code}$x -- |;
+		}
+		chop $legend;
+		chop $legend;
+		chop $legend;
+		chop $legend;
+		print qq|$legend\n|;
+		foreach my $testgroup ( qw(info health crypto) ) {
+			if (!defined($RESULT_OBJ{chain}{testresults}{$testgroup})) { next; }
+			&HR;
+			my $group = ucfirst($testgroup);
+			print qq|$COLORS{light}$group tests:$COLORS{reset}\n|;
+			foreach my $test (@{$CONFIG{config}{testorder}{$testgroup}}) {
+				if (!defined($RESULT_OBJ{chain}{testresults}{$testgroup}{$test})) { next; }
+				&Print_Test_Status($test,$RESULT_OBJ{chain}{testresults}{$testgroup}{$test}{status},$RESULT_OBJ{chain}{testresults}{$testgroup}{$test}{details});
+			}
+		}
+		&HR;
+	}
+
+	### Convert PEM to base64 PKCS#12 ###
+	if ($CONFIG{CMD} eq 'pemtobase64pkcs12') {
+		chomp $RESULT_OBJ{pkcs12}{base64data};
+		&Print_Header('Base64 PKCS#12 certificate:');
+		print qq|$RESULT_OBJ{pkcs12}{base64data}\n|;
+		&HR;
+	}
+
+	### Print private key if necessary ###
+	if ($CONFIG{CMD} =~ /(coresslcert|csrsha256|gencsr|pkcs12topem|removepassphrase|selfsignedcert)/) {
+		&Print_Header('Private Key:');
+		if (defined($RESULT_OBJ{0}{privatekey})) {
+			chomp $RESULT_OBJ{0}{privatekey};
+			print qq|$RESULT_OBJ{0}{privatekey}\n|;
+		} else {
+			chomp $RESULT_OBJ{privatekey};
+			print qq|$RESULT_OBJ{privatekey}\n|;
+		}
+		&HR;
+	}
+
+	### Print certificate if necessary ###
+	if ($CONFIG{CMD} =~ /(coresslcert|pkcs12topem|pkcs7topem|selfsignedcert)/) {
+		chomp $RESULT_OBJ{0}{certificate};
+		&Print_Header('Certificate:');
+		print qq|$RESULT_OBJ{0}{certificate}\n|;
+		if ($RESULT_OBJ{chain}{info}{length} > 1) {
+			&HR;
+			&Print_Header('CA Bundle:');
+		}
+		for (my $i=1; $i<$RESULT_OBJ{chain}{info}{length}; $i++) {
+			chomp $RESULT_OBJ{$i}{certificate};
+			print qq|$RESULT_OBJ{$i}{certificate}\n|;
+		}
+		&HR;
+	}
+
+	### Print CSR if necessary ###
+	if ($CONFIG{CMD} =~ /(csrsha256|gencsr)/) {
+		chomp $RESULT_OBJ{0}{csr};
+		&Print_Header('CSR:');
+		print qq|$RESULT_OBJ{0}{csr}\n|;
+		&HR;
+	}
+
+	if ($CONFIG{CMD} eq 'genclbjson') {
+		&Print_Header(qq|CLB JSON:|);
+		my $clbjson = encode_json($RESULT_OBJ{clbjsonobj});
+		print qq|$clbjson\n|;
+		&HR;
+	}
+}
+
+
+
+
+
+### FUNCTIONS THAT TOUCH THE FILESYSTEM ###
+
+############################
+##  Decode a base64 blob  ##
+############################
+sub Decode_Base64_Data {
+	my $data = shift;
+	return MIME::Base64::decode($data);
+}
+
+
+############################
+##  Write data to a file  ##
+############################
+sub Write_File {
+# FIXME: Check to see if it will overwrite an existing file and offer the option to rename, append an index, or pass in a "force overwrite" flag
+	my ($data,$filename,$description) = @_;
+	open FILE, qq|>$filename|;
+	binmode FILE;
+	print FILE $data;
+	close(FILE);
+	if ($description ne 'quiet') {
+		print qq|$COLORS{bluerev}$description saved as $filename.$COLORS{reset}\n|;
+		&HR;
+	}
+}
+
+
+###################################
+##  Prepare working environment  ##
+###################################
+sub Prepare_Environment {
+	if ( ( !defined($CONFIG{HOME}) ) || ($CONFIG{HOME} eq '/') ) { &Bail('Unable to properly determine home directory.'); }
+	qx|mkdir -p $CONFIG{WORKINGDIR}|;
+	chmod(0700,$CONFIG{WORKINGDIR});
+
+	### Early versions of this script had the working directory in a suboptimal location ###
+	if ( -d $CONFIG{HOME} . '/.ssltool' ) {
+		print qq|Removing legacy configuration directory... |;
+		unlink qq|$CONFIG{HOME}/.ssltool/Tiny.pm|;
+		unlink qq|$CONFIG{HOME}/.ssltool/cacert.pem|;
+		unlink qq|$CONFIG{HOME}/.ssltool/webconfig.json|;
+		rmdir qq|$CONFIG{HOME}/.ssltool/|;
+		print qq|Done.\n|;
+	}
+}
+
+
+#####################################
+##  Look for and load JSON module  ##
+#####################################
+sub Load_JSON_Module {
+	eval { require "$CONFIG{JSON_MOD_FILE}"; };
+# FIXME: This does not verify that it was unable to actually parse usable code in the module file
+	if ($@) {
+		print "JSON module not found. Downloading module... ";
+		unlink $CONFIG{JSON_MOD_FILE};
+		&Download_File($CONFIG{JSON_MOD_FILE},$CONFIG{JSON_MOD_URL});
+		eval { require "$CONFIG{JSON_MOD_FILE}"; };
+		if ($@) { &Bail('Unable to load JSON module.'); }
+		print "Done.\n";
+	}
+
+	### Activate JSON module ###
+# FIXME: Make sure this succeeds (i.e., handle errors)
+	eval { JSON::Tiny->import(qw(decode_json encode_json)); };
+}
+
+
+#######################################################
+##  Save persistent dynamic configuration variables  ##
+#######################################################
+sub Load_External_Config {
+	my %json_obj = ();
+	my $cfg_json = '';
+	my $download_config = '';
+
+	### See if the config file exists ###
+	if (-e $CONFIG{CONF_FILE}) {
+		$cfg_json = &Read_File($CONFIG{CONF_FILE});
+		eval { %json_obj = %{decode_json($cfg_json)}; };
+		foreach my $x (keys %json_obj) { $CONFIG{config}{$x} = $json_obj{$x}; }
+	} else {
+		$download_config = 'Configuration file does not exist.';
+	}
+
+	### See if we could read the config file ###
+	if ( ($download_config eq '') && ( (!defined($CONFIG{config})) || (!defined($CONFIG{config}{ssltool}{cli_version})) ) ) { $download_config = qq|Configuration files exists but could not read.\n|; }
+
+	### Download new copy of configuration file if necessary ###
+	if ($download_config ne '') {
+		print 'Downloading SSLTool configuration file... ';
+		&Download_File($CONFIG{CONF_FILE},$CONFIG{CONF_URL});
+		$cfg_json = &Read_File($CONFIG{CONF_FILE});
+		eval { %json_obj = %{decode_json($cfg_json)}; };
+		foreach my $x (keys %json_obj) { $CONFIG{config}{$x} = $json_obj{$x}; }
+		print "Done.\n";
+	}
+	if (!defined($CONFIG{config}{ssltool}{cli_version})) { &Bail('Unable to load configuration.'); }
+
+# FIXME: Need to compare live version to cached version (deep compare of objects)
+}
+
+
+#######################
+##  Download a file  ##
+#######################
+sub Download_File {
+	my ($file,$uri) = @_;
+	qx|/usr/bin/curl -qso $file $uri|;
+}
+
+
+####################################################
+##  Find a working Identity authentication token  ##
+####################################################
+sub Locate_Identity_Token {
+	### Find base paths ###
+	my $system = qx|uname -s|;
+
+	### If a token was passed in on the command line, check it first ###
+	if ($CONFIG{IDENTITYTOKEN} ne '') {
+		if ($CONFIG{DEBUG}) { print qq|Checking supplied Identity token.\n|; }
+		my $supplied_response = &CURL_Pipe('checktoken','{}');
+		my %resp_obj = eval {%{decode_json($supplied_response)}};
+
+		### If there is no error then we have found a working token ###
+		if (!defined($resp_obj{error})) { return; }
+
+		$CONFIG{IDENTITYTOKEN} = '';
+	}
+
+	### Try to read a previously saved token file ###
+	if (-e $CONFIG{TOKEN_FILE}) {
+		$CONFIG{IDENTITYTOKEN} = &Read_File($CONFIG{TOKEN_FILE});
+		if ($CONFIG{DEBUG}) { print qq|Checking existing Identity token.\n|; }
+		my $supplied_response = &CURL_Pipe('checktoken','{}');
+		my %resp_obj = eval {%{decode_json($supplied_response)}};
+
+		### If there is no error then we have found a working token ###
+		if (!defined($resp_obj{error})) { return; }
+
+		$CONFIG{IDENTITYTOKEN} = '';
+	}
+
+	### Find path to sqlite ###
+	SQLITE: {
+		(-x '/usr/local/opt/sqlite/bin/sqlite3') && do { $CONFIG{sqlite3} = '/usr/local/opt/sqlite/bin/sqlite3'; last SQLITE; };
+		(-x '/usr/local/bin/sqlite3') && do { $CONFIG{sqlite3} = '/usr/local/bin/sqlite3'; last SQLITE; };
+		(-x '/usr/bin/sqlite3') && do { $CONFIG{sqlite3} = '/usr/bin/sqlite3'; last SQLITE; };
+		do { &Bail('Unable to find sqlite binary.'); };
+	}
+
+	### Used for finding the token in localstorage ###
+	my $hostname = $CONFIG{GUIURL};
+	$hostname =~ s/https:\/\///;
+
+	### Determine path to Chrome localstorage ###
+	$CONFIG{chrome_localstorage} = $CONFIG{HOME};
+	$CONFIG{chrome_localstorage} .= ($system =~ /Darwin/) ? '/Library/Application Support/Google/Chrome' : '/.config/google-chrome';
+	$CONFIG{chrome_localstorage} .= '/Default/Local Storage/';
+
+	### Determine path to Firefox localstorage ###
+	$CONFIG{firefox_localstorage} = $CONFIG{HOME};
+	$CONFIG{firefox_localstorage} .= ($system =~ /Darwin/) ? '/Library/Application Support/Firefox' : '/.mozilla/firefox';
+	$CONFIG{firefox_localstorage} .= '/' . qx!grep Path '$CONFIG{firefox_localstorage}/profiles.ini' | head -1 | cut -d'=' -f2!;
+	chomp $CONFIG{firefox_localstorage};
+	$CONFIG{firefox_localstorage} .= '/webappsstore.sqlite';
+
+	### Search Chrome for an SSLTool token ###
+	if ($CONFIG{DEBUG}) { print qq|Checking Chrome for Identity token (SSLTool).\n|; }
+	&_search_localstorage($CONFIG{chrome_localstorage} . 'https_' . $hostname . '_0.localstorage', 'SELECT HEX(value) FROM ItemTable WHERE key = "ssltool_session_token"');
+	if ($CONFIG{IDENTITYTOKEN} ne '') { return; }
+
+	### Search Firefox for an SSLTool token ###
+	if ($CONFIG{DEBUG}) { print qq|Checking Firefox for Identity token (SSLTool).\n|; }
+	my $originkey = reverse '344:sptth:.' . $hostname;
+	&_search_localstorage($CONFIG{firefox_localstorage},qq|SELECT HEX(value) FROM webappsstore2 WHERE originKey = "$originkey" AND key = "ssltool_session_token"|);
+	if ($CONFIG{IDENTITYTOKEN} ne '') { return; }
+
+	### Search Chrome for an Encore token ###
+	if ($CONFIG{DEBUG}) { print qq|Checking Chrome for Identity token (Encore).\n|; }
+	&_search_localstorage($CONFIG{chrome_localstorage} . 'https_encore.rackspace.com_0.localstorage', 'SELECT HEX(value) FROM ItemTable WHERE key="encoreSessionToken"');
+	if ($CONFIG{IDENTITYTOKEN} ne '') { return; }
+
+	### Search Firefox for an Encore token ###
+	if ($CONFIG{DEBUG}) { print qq|Checking Firefox for Identity token (Encore).\n|; }
+	&_search_localstorage($CONFIG{firefox_localstorage},'SELECT HEX(value) FROM webappsstore2 WHERE originKey = "moc.ecapskcar.erocne.:https:443" and key = "encoreSessionToken"');
+	if ($CONFIG{IDENTITYTOKEN} ne '') { return; }
+
+	### Extract a token object from the web browser's localstorage ###
+	sub _search_localstorage {
+		my ($file,$query) = @_;
+		my $cmd = qq|$CONFIG{sqlite3} '$file' '$query'|;
+		if ($CONFIG{DEBUG}) { print qq|$cmd\n|; }
+		my $result = qx|$cmd 2>/dev/null|;
+		my $x = pack 'H*', $result;
+		$x =~ s/[[:^print:]]//g;
+		my %obj = eval { %{decode_json($x)}; };
+		if ( (defined($obj{access}{token}{id})) && ($obj{access}{token}{id} ne '') ) { $CONFIG{IDENTITYTOKEN} = $obj{access}{token}{id}; }
+
+		if ( $CONFIG{IDENTITYTOKEN} ne '') {
+			my $json = &CURL_Pipe('checktoken','{}');
+			my %resp = eval {%{decode_json($json)}};
+
+			### If there was an error then the token is not valid ###
+			if (defined($resp{error})) { $CONFIG{IDENTITYTOKEN} = ''; }
+		}
+	}
+
+	### We failed to find a token object ###
+	&Bail('Unable to find a working Identity token (please access SSLTool or Encore in a browser first or use the "--authtoken" argument)');
+}
+
+
+#########################################################
+##  Make sure that connections to SSLTool are trusted  ##
+#########################################################
+sub Verify_CA_Certs {
+	my $rewrite = 1;
+	my $cacert = <<EOF;
+-----BEGIN CERTIFICATE-----
+MIIDJzCCApCgAwIBAgIBATANBgkqhkiG9w0BAQQFADCBzjELMAkGA1UEBhMCWkEx
+FTATBgNVBAgTDFdlc3Rlcm4gQ2FwZTESMBAGA1UEBxMJQ2FwZSBUb3duMR0wGwYD
+VQQKExRUaGF3dGUgQ29uc3VsdGluZyBjYzEoMCYGA1UECxMfQ2VydGlmaWNhdGlv
+biBTZXJ2aWNlcyBEaXZpc2lvbjEhMB8GA1UEAxMYVGhhd3RlIFByZW1pdW0gU2Vy
+dmVyIENBMSgwJgYJKoZIhvcNAQkBFhlwcmVtaXVtLXNlcnZlckB0aGF3dGUuY29t
+MB4XDTk2MDgwMTAwMDAwMFoXDTIwMTIzMTIzNTk1OVowgc4xCzAJBgNVBAYTAlpB
+MRUwEwYDVQQIEwxXZXN0ZXJuIENhcGUxEjAQBgNVBAcTCUNhcGUgVG93bjEdMBsG
+A1UEChMUVGhhd3RlIENvbnN1bHRpbmcgY2MxKDAmBgNVBAsTH0NlcnRpZmljYXRp
+b24gU2VydmljZXMgRGl2aXNpb24xITAfBgNVBAMTGFRoYXd0ZSBQcmVtaXVtIFNl
+cnZlciBDQTEoMCYGCSqGSIb3DQEJARYZcHJlbWl1bS1zZXJ2ZXJAdGhhd3RlLmNv
+bTCBnzANBgkqhkiG9w0BAQEFAAOBjQAwgYkCgYEA0jY2aovXwlue2oFBYo847kkE
+VdbQ7xwblRZH7xhINTpS9CtqBo87L+pW46+GjZ4X9560ZXUCTe/LCaIhUdib0GfQ
+ug2SBhRz1JPLlyoAnFxODLz6FVL88kRu2hFKbgifLy3j+ao6hnO2RlNYyIkFvYMR
+uHM/qgeN9EJN50CdHDcCAwEAAaMTMBEwDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG
+9w0BAQQFAAOBgQAmSCwWwlj66BZ0DKqqX1Q/8tfJeGBeXm43YyJ3Nn6yF8Q0ufUI
+hfzJATj/Tb7yFkJD57taRvvBxhEf8UqwKEbJw8RCfbz6q1lu1bdRiBHjpIUZa4JM
+pAwSremkrj/xw0llmozFyD4lt5SZu5IycQfwhl7tUCemDaYj+bvLpgcUQg==
+-----END CERTIFICATE-----
+EOF
+
+	if (-e $CONFIG{CACERT_FILE}) {
+		my $x = &Read_File($CONFIG{CACERT_FILE});
+		if ($x eq $cacert) { $rewrite = 0; }
+	}
+
+	if ($rewrite) {
+		open(FH, ">$CONFIG{CACERT_FILE}");
+		print FH $cacert;
+		close FH;
+	}
+}
+
+
+###################################
+##  Download the latest version  ##
+###################################
+sub Self_Update {
+	### Determine whether or not the user has the required file permissions ###
+	my $file_uid = (stat $CONFIG{MYPATH})[4];
+	my $user_uid = $>;
+	if ($file_uid != $user_uid) {
+		if ($user_uid != 0) {
+			&Bail(qq|Insufficent privileges to update "$CONFIG{MYPATH}". Perhaps try using "sudo"?|);
+		}
+	}
+
+	### Remove the config file to force a download of the new version ###
+	unlink $CONFIG{CONF_FILE};
+	&Load_External_Config;
+
+	### Download script ###
+	print 'Downloading ssltool-cli... ';
+	&Download_File($CONFIG{MYPATH},$CONFIG{CLI_URL});
+	chmod(0755,$CONFIG{MYPATH});
+
+	### Download config ###
+	&Download_File($CONFIG{CONF_FILE},$CONFIG{CONF_URL});
+	print qq|Done.\n|;
+
+	print qq|Updated to SSLTool CLI version $CONFIG{config}{ssltool}{cli_version}.\n|;
+	&HR;
+	exit;
+}
+
+
+##############################################
+##  Install Rackspace root CA certificates  ##
+##############################################
+sub Install_RS_Certs {
+	### This is only supported on pure Linux ###
+	my $system = qx|uname -s|;
+	chomp $system;
+
+	### OSX has an installer package ###
+	if ($system eq 'Darwin') { &Bail('Detected OSX. Please install the OSX package found at the following link: https://ssltool.rackspace.com/rscerts/'); }
+
+	### Anything else is completely unsupported
+	if ($system ne 'Linux') { &Bail('Unsupported OS (must be a Linux system). Please manually install the certificates from the following link: https://ssltool.rackspace.com/rscerts/'); }
+
+	### Must be run as the root user ###
+	my $user_uid = $>;
+	if ($user_uid != 0) { &Bail('This function must be run with administrative privileges. Perhaps try running "sudo ' . $CONFIG{MYPATH} . ' rscerts"'); }
+
+	### Find OpenSSL binary ###
+	my $openssl_bin = qx|which openssl|;
+	chomp $openssl_bin;
+	if ($openssl_bin eq '') { &Bail('Unable to find OpenSSL binary.'); }
+
+	my $opensslver_cmd = qx|$openssl_bin version|;
+	my $openssl_ver = ($opensslver_cmd =~ /1\.1\.0/) ? '1.1.x' : '1.0.x';
+	print qq|Detected OpenSSL version $openssl_ver.\n|;
+
+	### Identify Linux distribution and commands ###
+	my $certdldir = $CONFIG{WORKINGDIR} . '/rscerts';
+	mkdir $certdldir,0755;
+	my $distro = '';
+	my $certdir = '';
+	my $updatecmd = '';
+	my $precmd = '';
+
+	### Detect Linux distro ###
+	print 'Detecting Linux distro... ';
+
+	### Test for Ubuntu ###
+	if (-s '/etc/lsb-release') {
+		my $x = qx!grep "^DISTRIB_ID" /etc/lsb-release | grep Ubuntu!;
+		if ($x =~ /ubuntu/i) { $distro = 'ubuntu'; }
+	}
+
+	### Test for Debian ###
+	if (-s '/etc/os-release') {
+		my $x = qx!grep "^ID" /etc/os-release | grep debian!;
+		if ($x =~ /debian/i) { $distro = 'debian'; }
+	}
+
+	### Test for CentOS ###
+	if (-s '/etc/centos-release') {
+		my $x = qx!grep "CentOS" /etc/centos-release!;
+		if ($x =~ /centos/i) { $distro = 'centos'; }
+		if ($x =~ /release 6/) {
+			my $trust = qx!update-ca-trust check | grep -i "PEM/JAVA Status"!;
+			if ($trust =~ /disabled/i) {
+				### Enable the installation of custom trusted CA certificates ###
+				$precmd = 'update-ca-trust force-enable';
+			}
+		}
+	}
+
+	### Test for Red Hat ###
+	if (-s '/etc/redhat-release') {
+		my $x = qx!grep "Red Hat" /etc/redhat-release!;
+		if ($x =~ /red hat/i) { $distro = 'rhel'; }
+		if ($x =~ /release 6/) {
+			my $trust = qx!update-ca-trust check | grep -i "PEM/JAVA Status"!;
+			if ($trust =~ /disabled/i) {
+				### Enable the installation of custom trusted CA certificates ###
+				$precmd = 'update-ca-trust force-enable';
+			}
+		}
+	}
+
+	### Test for Fedora ###
+	if (-s '/etc/fedora-release') {
+		$distro = 'fedora';
+	}
+
+	### Test for Arch ###
+	if (-s '/etc/arch-release') {
+		$distro = 'arch';
+	}
+
+	### Test for Gentoo ###
+	if (-s '/etc/gentoo-release') {
+		$distro = 'gentoo';
+	}
+
+	DISTROCASE: {
+		( ($distro eq 'ubuntu') || ($distro eq 'debian') ) && do {
+			$certdir = '/usr/local/share/ca-certificates';
+			$updatecmd = 'update-ca-certificates extract';
+			last DISTROCASE;
+		};
+		( ($distro eq 'centos') || ($distro eq 'rhel') ) && do {
+			$certdir = '/etc/pki/ca-trust/source/anchors';
+			$updatecmd = 'update-ca-trust extract';
+			last DISTROCASE;
+		};
+		($distro eq 'fedora') && do {
+			$certdir = '/etc/pki/ca-trust/source/anchors';
+			$updatecmd = 'update-ca-trust extract';
+			last DISTROCASE;
+		};
+		($distro eq 'arch') && do {
+			$certdir = '/etc/ca-certificates/trust-source/anchors';
+			$updatecmd = 'update-ca-trust extract';
+			last DISTROCASE;
+		};
+		($distro eq 'gentoo') && do {
+			$certdir = '/usr/local/share/ca-certificates';
+			$precmd = 'mkdir -p ' . $certdldir;
+			$updatecmd = 'update-ca-certificates';
+			last DISTROCASE;
+		};
+		do { &Bail('Unable to identify a supported distro. Please manually install the certificates from the following link: https://ssltool.rackspace.com/rscerts/'); };
+	}
+
+	print qq|$distro.\n|;
+
+	### List commands that will be run ###
+	print qq|\n|;
+	print qq|The root certificate files will be downloaded to the following directory: $COLORS{light}$certdldir$COLORS{reset}\n\n|;
+	print qq|After validation the certificate files will be moved to the following directory: $COLORS{light}$certdir$COLORS{reset}\n\n|;
+	if ($precmd ne '') { print qq|The following command(s) will be run before copying the certificate files: $COLORS{light}$precmd$COLORS{reset}\n\n|; }
+	print qq|The following command will be run after the certificate files have been copied: $COLORS{light}$updatecmd$COLORS{reset}\n\n|;
+	print qq|Type "$COLORS{red}yes$COLORS{reset}" to continue: |;
+	my $input = '';
+	chomp ($input = <STDIN>);
+	if ($input ne 'yes') { &Bail('Exiting based on user input.'); }
+	print qq|\n|;
+
+	my @certlist = ('rs_root_ca_1.crt','rs_issuing_ca_1.crt','rs_ca_level1.crt','ord1_rs_ca_01.crt','lon3_rs_ca_01.crt','rs_internal_ca.crt');
+	foreach my $cert (@certlist) {
+		### Download certificate ###
+		my $file = $certdldir . '/' . $cert;
+		&Download_File($file, $CONFIG{RSCERTS_URL} . '/' . $cert);
+
+		### Make sure we are able to download and parse certificate ###
+		my $cn_cmd = $openssl_bin . ' x509 -subject -noout -in ' . $file;
+		if ($openssl_ver eq '1.1.x') {
+			$cn_cmd .= q! 2>&1 | sed -n '/^subject/s/^.*CN = //p' | sed -e 's/\/.*//g'!;
+		} else {
+			$cn_cmd .= q! 2>&1 | sed -n '/^subject/s/^.*CN=//p' | sed -e 's/\/.*//g'!;
+		}
+		if ($CONFIG{DEBUG}) { print qq|$cn_cmd\n|; }
+		my $cn = qx|$cn_cmd|;
+		chomp $cn;
+		if ($cn eq '') { &Bail(qq|Error downloading certificate file $cert ($file).|); }
+
+		### Move certificate file into place ###
+		print qq|Verified "$cn".\n|;
+		my $mv_cmd = qq|mv $file $certdir/$cert|;
+		if ($CONFIG{DEBUG}) { print qq|$mv_cmd\n|; }
+		qx|$mv_cmd|;
+	}
+
+	### Activate new certificates ###
+	print qq|\n|;
+	print qq|Activating certificate files... |;
+	qx|$updatecmd|;
+	print qq|Done.\n|;
+	&HR;
+	&Print_Header('Installation of trusted Rackspace root CA files has finished.');
+	exit;
+}
+
+
+######################################
+##  Print a certificate's contents  ##
+######################################
+sub Print_Certificate_Information {
+	my $o = shift;
+	foreach my $field ( qw(hn cn alt e o ou l st c issuer begin end purposes subject fullissuer signaturedetails serial lastcheck testresults) ) {
+		if ( ( defined($o->{$field}) ) && ($o->{$field} ne '') ) {
+			### If the Common Name is the same as the Hostname, don't print it ###
+			if ( ($field eq 'cn') && (defined($o->{hn})) && ($o->{cn} eq $o->{hn}) ) { next; }
+
+			print qq|$COLORS{light}|;
+			printf ("%20s", $CONFIG{config}{x509fields}{$field});
+			print qq|$COLORS{reset}: |;
+
+			my $alert = '';
+
+			ALERTCASE: {
+				( ($field eq 'end') && ($o->{$field} =~ /ago/) ) && do {
+					$alert = 'redwarn';
+					last ALERTCASE;
+				};
+				( ($field eq 'testresults') && ($o->{$field} =~ /Failed/) ) && do {
+					$alert = 'redwarn';
+					last ALERTCASE;
+				};
+				( ($field eq 'end') && ($o->{rawend}-time < 86400*14) ) && do {
+					$alert = 'yellowwarn';
+					last ALERTCASE;
+				};
+			}
+
+			if ($alert ne '') { print qq|$COLORS{$alert}|; }
+			print qq|$o->{$field}|;
+			if ($alert ne '') { print qq|$COLORS{reset}|; }
+
+			### These fields have additional data to be added ###
+			print qq|\n|;
+			if ( ($field eq "hn") && (defined($o->{port})) ) { 
+				print qq|$COLORS{light}|;
+				printf ("%20s", $CONFIG{config}{x509fields}{port});
+				print qq|$COLORS{reset}: $o->{port}\n|;
+			}
+		}
+	}
+
+	### Display failed tests when viewing SSLWatch data ###
+	if ( ($CONFIG{CMD} eq 'sslwatch') && ($o->{failedtests} ne '') ) {
+		print qq|$COLORS{light}|;
+		printf ("%20s", 'Failed tests');
+		print qq|$COLORS{reset}: $COLORS{redwarn}$o->{failedtests}$COLORS{reset}\n|;
+	}
+	&HR;
+}
+
+
+
+##########################################
+##  Send and receive data to/from cURL  ##
+##########################################
+sub CURL_Pipe {
+	my ($cmd,$json) = @_;
+	my $curl_cmd = qq|/usr/bin/curl -qs -H "Content-Type: application/json" -H "X-SSLTool-Source: cli" -H "X-Auth-Token: $CONFIG{IDENTITYTOKEN}" -d '$json' $CONFIG{APIURL}/$cmd|;
+	if ($CONFIG{PRINTCURL}) { print qq|$curl_cmd\n|; }
+	my $output = qx|$curl_cmd|;
+	return $output;
+}
+
+
+#################################
+##  Send a command to the API  ##
+#################################
+sub Send_API_Command {
+	my $command = shift;
+	$CONFIG{CURRENTAPICOMMAND} = $command;
+	if ($CONFIG{DEBUG}) { $API_OBJ{debug} = 1; }
+
+	### See if we already have a working token ###
+	if (!$CONFIG{TOKEN_FOUND}) {
+
+		### Retrieve Identity token ###
+		&Locate_Identity_Token;
+
+		### Save working Identity token ###
+		open FILE, qq|>$CONFIG{TOKEN_FILE}|;
+		print FILE $CONFIG{IDENTITYTOKEN};
+		close(FILE);
+		chmod(0600,$CONFIG{TOKEN_FILE});
+
+		### We no longer have to check for a token ###
+		$CONFIG{TOKEN_FOUND} = 1;
+	}
+
+	my $request_json = encode_json(\%API_OBJ);
+	my $response = &CURL_Pipe($command,$request_json);
+
+	if ($CONFIG{VERBOSE}) { print Dumper $response; }
+
+# FIXME: Make sure this succeeds (i.e., handle errors)
+	%RESULT_OBJ = %{decode_json($response)};
+
+	### See if there is a more recent version ###
+	&Check_Version();
+
+	### Print debug data ###
+	if (defined($RESULT_OBJ{debug_data})) {
+		&Print_Header(qq|Debug data for API command "$command"|);
+		foreach my $d (@{$RESULT_OBJ{debug_data}}) { print qq|$d\n|; }
+		&HR;
+	}
+
+	### Check for error status ###
+	if (defined($RESULT_OBJ{error})) {
+		### When performing an IP audit an error status is not fatal ###
+		if ($CONFIG{CURRENTAPICOMMAND} ne 'auditip') {
+			&Bail("There was an error during processing: $RESULT_OBJ{error}");
+			exit;
+		}
+	}
+}
+
+
+
+
+
+### FUNCTIONS THAT SEND API CALLS ###
+
+
+##############################
+##  Show SSLTool Changelog  ##
+##############################
+sub API_Changelog {
+	&Send_API_Command('changelog');
+	&Print_Header('Changelog');
+	my $prev = '';
+	foreach my $id (sort {$a <=> $b} keys %{$RESULT_OBJ{changelog}}) {
+		my $cur = $RESULT_OBJ{changelog}{$id}{version};
+		my $ver = $cur;
+		if ($cur eq $prev) { $ver = ''; } else {
+			if ($cur ne '1.0.0') { &HR; }
+		}
+		printf ("%-8s%-10s%-s\n", $ver, $RESULT_OBJ{changelog}{$id}{type}, $RESULT_OBJ{changelog}{$id}{entry});
+		$prev = $cur;
+	}
+	&HR;
+}
+
+
+##########################################
+##  Report statistics on SSLTool usage  ##
+##########################################
+sub API_Load_Stats {
+	my %totals = ();
+	### Initialize counters for totals ###
+	foreach my $i ('api','gui','cli') {
+		foreach my $j ('1','7','30') {
+			$totals{apistats}{$i}{$j} = 0;
+		}
+	}
+
+	&Send_API_Command('stats');
+	&Print_Header(sprintf("%-30s%20s%20s%20s",'API calls','API 1d/7d/30d','CLI 1d/7d/30d','GUI 1d/7d/30d'));
+	foreach my $op (sort keys %{$RESULT_OBJ{apistats}}) {
+		if ($op eq 'Total') { next; }
+		printf ("%s\n%-30s%20s%20s%20s\n", qq|$op - $CONFIG{config}{apidesc}{$op}|, '', qq|$RESULT_OBJ{apistats}{$op}{api}{1}/$RESULT_OBJ{apistats}{$op}{api}{7}/$RESULT_OBJ{apistats}{$op}{api}{30}|, qq|$RESULT_OBJ{apistats}{$op}{cli}{1}/$RESULT_OBJ{apistats}{$op}{cli}{7}/$RESULT_OBJ{apistats}{$op}{cli}{30}|, qq|$RESULT_OBJ{apistats}{$op}{gui}{1}/$RESULT_OBJ{apistats}{$op}{gui}{7}/$RESULT_OBJ{apistats}{$op}{gui}{30}|);
+		foreach my $i ('api','gui','cli') {
+			foreach my $j ('1','7','30') {
+				$totals{apistats}{$i}{$j} += $RESULT_OBJ{apistats}{$op}{$i}{$j};
+			}
+		}
+	}
+	printf ("%s\n%-30s%20s%20s%20s\n", 'Totals', '', qq|$totals{apistats}{api}{1}/$totals{apistats}{api}{7}/$totals{apistats}{api}{30}|, qq|$totals{apistats}{cli}{1}/$totals{apistats}{cli}{7}/$totals{apistats}{cli}{30}|, qq|$totals{apistats}{gui}{1}/$totals{apistats}{gui}{7}/$totals{apistats}{gui}{30}|);
+	&HR;
+
+	&Print_Header('SSLWatch processing');
+	&Print_Header(sprintf("%-25s%-25s%12s%7s",'  SSLWatch Start','  SSLWatch End','Unreachable','Total'));
+	foreach my $i (sort {$b cmp $a} keys %{$RESULT_OBJ{sslwatchstats}}) { printf ("%25s%25s%12s%7s\n", strftime("%Y-%m-%d %H:%M:%S %Z", localtime($RESULT_OBJ{sslwatchstats}{$i}{start})), strftime("%Y-%m-%d %H:%M:%S %Z", localtime($RESULT_OBJ{sslwatchstats}{$i}{stop})), $RESULT_OBJ{sslwatchstats}{$i}{unreachable}, $RESULT_OBJ{sslwatchstats}{$i}{total}); }
+	&HR;
+}
+
+
+###############################################
+##  Audit CORE account/device for SSL usage  ##
+###############################################
+sub API_CORE_IP_Audit {
+# FIXME: Investigate possibility of building out the suggested "batch" mode feature
+	CASE: {
+		( ( ($CLI_ARGS{CORE}{ACCOUNT} ne '') && ($CLI_ARGS{CORE}{DEVICE} ne '') ) || ( ($CLI_ARGS{CORE}{ACCOUNT} eq '') && ($CLI_ARGS{CORE}{DEVICE} eq '') ) ) && do { &Bail('Please only specify the CORE Account or Device number (use either "--coreaccount XXXX" or "--coredevice XXXX")'); last CASE; };
+		($CLI_ARGS{CORE}{ACCOUNT} ne '') && do { $API_OBJ{corequerytype} = 'account'; $API_OBJ{coreid} = $CLI_ARGS{CORE}{ACCOUNT}; last CASE; };
+		($CLI_ARGS{CORE}{DEVICE} ne '') && do { $API_OBJ{corequerytype} = 'device'; $API_OBJ{coreid} = $CLI_ARGS{CORE}{DEVICE}; last CASE; };
+	}
+
+	&Send_API_Command('coreiplist');
+
+	### Retrieve server list ###
+	my $account = $RESULT_OBJ{account};
+	my $accountid = $RESULT_OBJ{accountid};
+	my %SERVERS = %{$RESULT_OBJ{serverlist}};
+
+	sub _auditip {
+		my ($text, $ip) = @_;
+		my $subject = '';
+		my $color = '';
+		my $certstatus = '';
+		%API_OBJ = ();
+		$API_OBJ{ip} = $ip;
+		&Send_API_Command('auditip');
+
+		if (defined($RESULT_OBJ{error})) {
+			$subject = $RESULT_OBJ{error};
+			if ($RESULT_OBJ{error} =~ /Unable to retrieve/) {
+				$color = $STATUS{audit_avail}{color};
+				$certstatus = 'Available';
+			} else {
+				$color = $STATUS{audit_unk}{color};
+				$certstatus = 'Unknown';
+			}
+		} else {
+			$subject = $RESULT_OBJ{cn};
+			$color = $STATUS{$RESULT_OBJ{css}}{color};
+
+			STATUSCASE: {
+				($RESULT_OBJ{css} eq 'audit_inuse') && do { $certstatus = 'In Use'; last STATUSCASE; };
+				($RESULT_OBJ{css} eq 'audit_exp') && do { $certstatus = 'Expired'; last STATUSCASE; };
+				($RESULT_OBJ{css} eq 'audit_avail') && do { $certstatus = 'Available'; last STATUSCASE; };
+			}
+		}
+
+# FIXME: IPv6 addresses are very wide and throw off the formatting
+		printf ("  %-16s%s%-17s%-11s%s%s\n", $text, $color, $ip, $certstatus, $subject, $COLORS{reset});
+	}
+
+	&Print_Header(qq|Account: $account ($accountid)|);
+	if ( (keys %SERVERS) == 0 ) {
+		&Print_Header(qq|No Dedicated servers or hardware firewalls found.|);
+	} else {
+		foreach my $server (keys %SERVERS) {
+			print qq|Server: $server - $SERVERS{$server}{servername}\n|;
+			&_auditip('Primary IPv4', $SERVERS{$server}{primary});
+			if ($SERVERS{$server}{secondary} ne '') { foreach my $i (split(/ /,$SERVERS{$server}{secondary})) { &_auditip('Secondary IPv4', $i); } }
+			if ($SERVERS{$server}{primary6} ne '') { foreach my $i (split(/ /,$SERVERS{$server}{primary6})) { &_auditip('Primary IPv6', $i); } }
+			if ($SERVERS{$server}{secondary6} ne '') { foreach my $i (split(/ /,$SERVERS{$server}{secondary6})) { &_auditip('Secondary IPv6',$i); } }
+			print qq|\n|;
+		}
+	}
+}
+
+
+##########################################
+##  Retrieve SSL certificate from CORE  ##
+##########################################
+sub API_CORE_SSL_Cert {
+	if ($CLI_ARGS{CORE}{CERTID} eq '') { &Bail('Please specify the certificate ID. ( --corecertid XXXXXX )'); }
+	$API_OBJ{certificateid} = $CLI_ARGS{CORE}{CERTID};
+
+	### Send API request ###
+	&Send_API_Command('coresslcert');
+	&Print_Certificate_Chain;
+
+	### Upload the certificate files to a CORE device ###
+	if ($CLI_ARGS{CORE}{DEVICE} ne '') {
+		if ($CLI_ARGS{HTPATH} eq '') { &Bail('Unable to find path to Hammertime. (Try setting it with "--htpath /path/to/ht")'); }
+
+		### Gather certificate data ###
+		my $cn = $RESULT_OBJ{0}{data}{cn};
+		$cn =~ s/^\*/wildcard/;
+		my $NOW = time;
+		my $localpath = qq|$CONFIG{WORKINGDIR}/certificate-$cn-$NOW|;
+		my $remotepath = qq|certificate-$cn-${NOW}|;
+		mkdir $localpath,0700;
+		my $cabundle = '';
+		for (my $i=1; $i<$RESULT_OBJ{chain}{info}{length}; $i++) {
+			chomp $RESULT_OBJ{$i}{certificate};
+			$cabundle .= qq|$RESULT_OBJ{$i}{certificate}\n|;
+		}
+
+		### Save temporary files ###
+		&Write_File($RESULT_OBJ{0}{certificate},qq|$localpath/${cn}.crt|,'quiet');
+		&Write_File($RESULT_OBJ{0}{privatekey},qq|$localpath/${cn}.key|,'quiet');
+		&Write_File($cabundle,qq|$localpath/${cn}.ca.crt|,'quiet');
+		chmod(0600,qq|$localpath/${cn}.key|);
+
+		### Send files using Hammertime ###
+		print qq|Using Hammertime to send certificate files to CORE device $CLI_ARGS{CORE}{DEVICE}...\n|;
+		&HR;
+		my $CMD = qq!$CLI_ARGS{HTPATH} -vv --copy $localpath $CLI_ARGS{CORE}{DEVICE}:./$remotepath 2>&1 | grep -Ei "succe|warning|error"!;
+		if ($CONFIG{DEBUG}) { print qq|$CMD\n|; }
+		my $status = qx|$CMD|;
+		if ($status =~ /succe/i) {
+			print qq|$COLORS{bluerev}Transfer successful. Certificate files have been uploaded to the directory /home/rack/${remotepath} on CORE device $CLI_ARGS{CORE}{DEVICE}. Please remove this directory once you have finished.$COLORS{reset}\n|;
+		} else {
+			print qq|$COLORS{bluerev}Unable to transfer files to device.$COLORS{reset}\n$status|;
+		}
+		&HR;
+
+		### Clean up temporary files ###
+		unlink qq|$localpath/${cn}.crt|;
+		unlink qq|$localpath/${cn}.key|;
+		unlink qq|$localpath/${cn}.ca.crt|;
+		rmdir $localpath;
+	}
+}
+
+
+###########################################
+##  Interact with the SSLWatch database  ##
+###########################################
+sub API_SSLWatch {
+	CASE: {
+		($CLI_ARGS{SSLWATCH}{EXCEL} == 1) && do {
+			$API_OBJ{command} = 'excel';
+			last CASE;
+		};
+		($CLI_ARGS{SSLWATCH}{LIST} == 1) && do {
+			$API_OBJ{command} = 'list';
+			$API_OBJ{location} = $CLI_ARGS{SSLWATCH}{LOCATION};
+			$API_OBJ{type} = $CLI_ARGS{SSLWATCH}{TYPE};
+			last CASE;
+		};
+		($CLI_ARGS{SSLWATCH}{SEARCH} ne '') && do {
+			$API_OBJ{command} = 'search';
+			$API_OBJ{searchquery} = $CLI_ARGS{SSLWATCH}{SEARCH};
+			if ($CLI_ARGS{SSLWATCH}{SEARCH} eq '') { &Bail('Please specify search terms ( --search blah )'); }
+			$API_OBJ{exact} = $CLI_ARGS{SSLWATCH}{EXACT};
+			last CASE;
+		};
+		($CLI_ARGS{SSLWATCH}{FAILURES} == 1) && do {
+			$API_OBJ{command} = 'failures';
+			$API_OBJ{location} = $CLI_ARGS{SSLWATCH}{LOCATION};
+			if ($CLI_ARGS{SSLWATCH}{TESTS} eq '') { &Bail('Please specify test(s) to display ( --tests test1,test2 )'); }
+			$API_OBJ{tests} = $CLI_ARGS{SSLWATCH}{TESTS};
+			last CASE;
+		};
+		do { &Bail('Please specify a valid SSLWatch command.'); }
+	}
+
+	&Send_API_Command('sslwatch');
+
+	if ($API_OBJ{command} eq 'excel') {
+		&Write_File(&Decode_Base64_Data($RESULT_OBJ{excel_data}),qq|$CONFIG{HOME}/$RESULT_OBJ{excel_filename}|,'SSLWatch Excel file');
+	} else {
+		my $header = ($API_OBJ{command} eq 'search') ? qq|SSLWatch results for query $COLORS{green}$CLI_ARGS{SSLWATCH}{SEARCH}$COLORS{reset}:| : $RESULT_OBJ{stats}{description};
+		&Print_Header($header);
+
+		### Print results to terminal ###
+		sub _sslwatch_sort {
+			if ($CLI_ARGS{SSLWATCH}{SORT} eq 'hn') {
+				CASE: {
+					($a lt $b) && do { return -1; last CASE; };
+					($a eq $b) && do { return 0; last CASE; };
+					do { return 1; };
+				}
+			} else {
+				CASE: {
+					($RESULT_OBJ{results}{$a}{rawend} < $RESULT_OBJ{results}{$b}{rawend}) && do { return -1; last CASE; };
+					($RESULT_OBJ{results}{$a}{rawend} == $RESULT_OBJ{results}{$b}{rawend}) && do { return 0; last CASE; };
+					do { return 1; };
+				}
+			}
+		}
+	
+		foreach my $hn (sort _sslwatch_sort keys %{$RESULT_OBJ{results}}) {
+			($RESULT_OBJ{results}{$hn}{hn},$RESULT_OBJ{results}{$hn}{port}) = split('__',$hn);
+			&Print_Certificate_Information(\%{$RESULT_OBJ{results}{$hn}}) ;
+		}
+		&Print_Header('Results returned: ' . $RESULT_OBJ{stats}{resultcount});
+	}
+}
+
+
+#############################################
+##  Convert a PKCS #12 certificate to PEM  ##
+#############################################
+sub API_PKCS12_PEM {
+	if ($CLI_ARGS{PKCS12FILE} eq '') { &Bail('Please specify the PKCS #12 file ( --pkcs12 /path/to/server.pfx ).'); }
+	my $pkcs12data;
+	if (-s $CLI_ARGS{PKCS12FILE}) {
+		$pkcs12data = &Read_File($CLI_ARGS{PKCS12FILE});
+	} else {
+		&Bail('PKCS#12 file ' . $CLI_ARGS{PKCS12FILE} . ' appears to be empty.');
+	}
+
+	### If it is a base64 file we can send it as is ###
+	if ($CONFIG{CMD} eq 'base64pkcs12topem') {
+		$API_OBJ{pkcs12base64} = $pkcs12data;
+	} else {
+		my $encoded = MIME::Base64::encode($pkcs12data);
+		$API_OBJ{pkcs12certificate} = $encoded;
+	}
+
+	if ($CLI_ARGS{PASSPHRASE} ne '') { $API_OBJ{passphrase} = $CLI_ARGS{PASSPHRASE}; }
+
+	### Send API request ###
+	&Send_API_Command($CONFIG{CMD});
+	&Print_Certificate_Chain;
+}
+
+
+####################################
+##  Examine a remote certificate  ##
+####################################
+sub API_Remote_Cert {
+	if ($CLI_ARGS{HOST} eq '') { &Bail('Please specify the hostname. ( -h www.domain.com )'); }
+	if ($CLI_ARGS{PORT} eq '') { $CLI_ARGS{PORT} = "443"; }
+	$API_OBJ{host} = $CLI_ARGS{HOST};
+	$API_OBJ{port} = $CLI_ARGS{PORT};
+
+	if ($CLI_ARGS{CACHED}) { $API_OBJ{cached} = '1'; }
+	if ($CLI_ARGS{TLS10}) { $API_OBJ{tls10} = 1; }
+	if ($CLI_ARGS{SERVERNAME} ne '') { $API_OBJ{servername} = $CLI_ARGS{SERVERNAME}; }
+
+	### Generate Permalink ###
+	my $permalink = qq|$CONFIG{GUIURL}/remote/$CLI_ARGS{HOST}/$CLI_ARGS{PORT}|;
+	if ($CLI_ARGS{CIPHERS}) {
+		$permalink .= '/scan';
+		if ($CLI_ARGS{TLS10}) { $permalink .= '/tls10'; }
+	}
+	&Print_Header(qq|Permalink: $permalink|);
+
+	### Send API request ###
+	&Send_API_Command('remotecert');
+	&Print_Certificate_Chain;
+
+	if ($CLI_ARGS{HEARTBLEED}) {
+		### Test for vulnerability to Heartbleed ###
+		&Send_API_Command('heartbleed');
+		&Print_Header('Heartbleed scan results:');
+		&Print_Test_Status('heartbleed', $RESULT_OBJ{result}{status}, $RESULT_OBJ{result}{details});
+		&HR;
+	}
+
+	if ($CLI_ARGS{OPENSSLCCS}) {
+		### Test for vulnerability to OpenSSLCCS ###
+		&Send_API_Command('opensslccs');
+		&Print_Header('OpenSSL CCS scan results:');
+		&Print_Test_Status('opensslccs', $RESULT_OBJ{result}{status}, $RESULT_OBJ{result}{details});
+		&HR;
+	}
+
+	if ($CLI_ARGS{CIPHERS}) {
+		### List all ciphers supported by the service ###
+		my $header = '';
+		&Send_API_Command('sslscan');
+
+		### Retrieve target information from API ###
+		my $hostinfo = $RESULT_OBJ{target}{servername};
+		if ( $RESULT_OBJ{target}{servername} ne $RESULT_OBJ{target}{ip} ) { $hostinfo .= qq| ($RESULT_OBJ{target}{ip})|; }
+
+		&Print_Header(qq|Extended SSL scan for port $RESULT_OBJ{target}{port} on host $hostinfo:|);
+
+		sub _print_scan_line {
+			my ($type,$version,$cipher,$bits,$iana,$strength) = @_;
+			my $color = ($bits eq "Bits") ? 'blue' : $CONFIG{strength}{$strength};
+
+			if ($type == 1) {
+				print $COLORS{$color} . sprintf ("%-12s%-10s%-7s%-30s%-40s\n", ucfirst($strength), $version, $bits, $cipher, $iana) . $COLORS{reset};
+			} else {
+				print $COLORS{$color} . sprintf ("%-12s%-30s%-40s%-7s%-30s\n", ucfirst($strength), $cipher, $iana, $bits, $version) . $COLORS{reset};
+			}
+		}
+
+		### Cipherscan test results ###
+		foreach my $test ('pci','secrecy','ids_waf') {
+			if (defined($RESULT_OBJ{testresults}{$test})) { &Print_Test_Status($test,$RESULT_OBJ{testresults}{$test}{status},$RESULT_OBJ{testresults}{$test}{details}); }
+		}
+
+		### Preferred ciphers ###
+		$header = qq|Preferred SSL ciphers\n|;
+		printf("\n%50s",$header);
+		&_print_scan_line(1,'Version','OpenSSL Cipher','Bits','IANA Name','Strength');
+		foreach my $ver ( qw( TLSv1.2 TLSv1.1 TLSv1.0 SSLv3 SSLv2 ) ) {
+			if (defined($RESULT_OBJ{preferredcipher}{$ver})) {
+				foreach my $cipher (keys %{$RESULT_OBJ{preferredcipher}{$ver}}) {
+					&_print_scan_line(1,$ver,$cipher,$RESULT_OBJ{preferredcipher}{$ver}{$cipher}{bits},$RESULT_OBJ{preferredcipher}{$ver}{$cipher}{iana},$RESULT_OBJ{preferredcipher}{$ver}{$cipher}{strength});
+				}
+			}
+		}
+
+		### Accepted ciphers ###
+		$header = qq|Accepted SSL ciphers (in server-preferred order)\n|;
+		printf("\n%63s",$header);
+		&_print_scan_line(2,'Versions','OpenSSL Cipher','Bits','IANA Name','Strength');
+		foreach my $cipher (split(' ',$RESULT_OBJ{cipherorder})) {
+			&_print_scan_line(2,$RESULT_OBJ{ciphers}{$cipher}{versions},$cipher,$RESULT_OBJ{ciphers}{$cipher}{bits},$RESULT_OBJ{ciphers}{$cipher}{iana},$RESULT_OBJ{ciphers}{$cipher}{strength});
+		}
+		&HR;
+	}
+}
+
+
+#############################################################################
+##  View/validate the contents of a CSR/private key/certificate/CA bundle  ##
+#############################################################################
+sub API_View_Validate {
+	### Import PKCS  #7 certificate ###
+	if ($CONFIG{CMD} eq 'pkcs7topem') {
+		if ($CLI_ARGS{CERTIFICATE} eq '') { &Bail('Please specify the certificate file. ( -c /path/to/server.pkcs7 )'); }
+		$API_OBJ{pkcs7cert} = &Read_File($CLI_ARGS{CERTIFICATE});
+	}
+
+	### Import supplied files ###
+	if ($CONFIG{CMD} eq 'validate') {
+		if ($CLI_ARGS{CSR} ne '') { $API_OBJ{csr} = &Read_File($CLI_ARGS{CSR}); }
+		if ($CLI_ARGS{KEY} ne '') { $API_OBJ{privatekey} = &Read_File($CLI_ARGS{KEY}); }
+		if ($CLI_ARGS{CERTIFICATE} ne '') { $API_OBJ{certificate} = &Read_File($CLI_ARGS{CERTIFICATE}); }
+		if ($CLI_ARGS{CABUNDLE} ne '') { $API_OBJ{cabundle} = &Read_File($CLI_ARGS{CABUNDLE}); }
+	}
+
+	### Import CSR ###
+	if ($CONFIG{CMD} =~ /(csrsha256|validatecsrkey|viewcsr)/) {
+		if ($CLI_ARGS{CSR} eq '') { &Bail('Please specify the CSR file. ( -r /path/to/server.csr )'); }
+		$API_OBJ{csr} = &Read_File($CLI_ARGS{CSR});
+	}
+
+	### Import private key ###
+	if ($CONFIG{CMD} =~ /(genclbjson|pemtobase64pkcs12|pemtopkcs12|removepassphrase|validatecertkey|validatecsrkey)/) {
+		if ($CLI_ARGS{KEY} eq '') { &Bail('Please specify the private key file. ( -k /path/to/server.key )'); }
+		$API_OBJ{privatekey} = &Read_File($CLI_ARGS{KEY});
+	}
+
+	### Import certificate ###
+	if ($CONFIG{CMD} =~ /(genclbjson|pemtobase64pkcs12|pemtopkcs12|validatecertcabundle|validatecertkey|viewcert)/) {
+		if ($CLI_ARGS{CERTIFICATE} eq '') { &Bail('Please specify the certificate file. ( -c /path/to/server.crt )'); }
+		$API_OBJ{certificate} = &Read_File($CLI_ARGS{CERTIFICATE});
+	}
+
+	### Import CA bundle ###
+	if ($CONFIG{CMD} =~ /(cabundle|genclbjson|viewcabundle)/) {
+		if ($CLI_ARGS{CABUNDLE} eq '') { &Bail('Please specify the CA bundle file. ( -b /path/to/cabundle.crt )'); }
+		$API_OBJ{cabundle} = &Read_File($CLI_ARGS{CABUNDLE});
+	}
+
+	### CA bundle is optional for these functions ###
+	if ($CONFIG{CMD} =~ /(pemtobase64pkcs12|pemtopkcs12)/) {
+		if ($CLI_ARGS{CABUNDLE} ne '') { $API_OBJ{cabundle} = &Read_File($CLI_ARGS{CABUNDLE}); }
+		if ($CLI_ARGS{PASSPHRASE} ne '') { $API_OBJ{curpassphrase} = $CLI_ARGS{PASSPHRASE}; }
+		if ($CLI_ARGS{NEWPASSPHRASE} ne '') { $API_OBJ{newpassphrase} = $CLI_ARGS{NEWPASSPHRASE}; }
+		if ($CLI_ARGS{FRIENDLYNAME} ne '') { $API_OBJ{friendlyname} = $CLI_ARGS{FRIENDLYNAME}; }
+	}
+
+	### SSL passphrase is required for this function ###
+	if ($CONFIG{CMD} eq 'removepassphrase') {
+		if ($CLI_ARGS{PASSPHRASE} eq '') { &Bail('Please provide the SSL passphrase ( --pass )'); }
+	}
+
+	### Import SSL passphrase ###
+	if ($CLI_ARGS{PASSPHRASE} ne '') { $API_OBJ{passphrase} = $CLI_ARGS{PASSPHRASE}; }
+
+	### Populate genclbjson variables if necessary ###
+	if ($CONFIG{CMD} eq 'genclbjson') {
+		$API_OBJ{clb_enabled} = $CLI_ARGS{CLB}{ENABLED};
+		$API_OBJ{clb_secure} = $CLI_ARGS{CLB}{SECURE};
+		$API_OBJ{clb_port} = $CLI_ARGS{CLB}{PORT};
+		if ($API_OBJ{clb_port} eq '') { &Bail('Please specify the port. ( --clbport 443 )'); }
+	}
+
+	### Send API request ###
+	&Send_API_Command($CONFIG{CMD});
+	&Print_Certificate_Chain;
+
+	### Save PKCS #12 file ###
+	if ($CONFIG{CMD} eq 'pemtopkcs12') { &Write_File(&Decode_Base64_Data($RESULT_OBJ{pkcs12}{data}),qq|$CONFIG{HOME}/$RESULT_OBJ{pkcs12}{filename}|,'PKCS #12 file'); }
+}
+
+
+#########################################
+##  Read a file's contents and return  ##
+#########################################
+sub Read_File {
+	my $file = shift;
+	my $output = '';
+
+	if (-e $file) {
+		open(FH,$file);
+		foreach my $line (<FH>) { $output .= $line; }
+		close FH;
+		return $output;
+	} else {
+		&Bail('Unable to read file "' . $file . '"');
+	}
+}
+
+
+#####################
+##  Generate DKIM ##
+#####################
+sub API_Gen_DKIM {
+	if ($CLI_ARGS{DOMAIN} eq '') { &Bail('Please specify the domain. ( -d domain.com )'); }
+	$API_OBJ{domain} = $CLI_ARGS{DOMAIN};
+	print qq|Generating DKIM for $CLI_ARGS{DOMAIN}:\n|;
+	&HR;
+	&Send_API_Command('gendkim');
+
+	&Print_Header('Private Key:');
+	print qq|$RESULT_OBJ{privatekey}\n|;
+	&HR;
+	&Print_Header('DNS entries:');
+	print qq|$RESULT_OBJ{publicdns}\n|;
+	&HR;
+}
+
+
+########################################################
+##  Return a valid CA bundle for a given certificate  ##
+########################################################
+sub API_CA_Bundle {
+	my $cert = '';
+	if ($CLI_ARGS{CERTIFICATE} eq '') { &Bail('Please specify the certificate file. ( -c /path/to/server.crt )'); }
+
+	open(FH,$CLI_ARGS{CERTIFICATE});
+	foreach my $line (<FH>) { $cert .= $line; }
+	close FH;
+
+	$API_OBJ{certificate} = $cert;
+
+	### Send API request ###
+	&Send_API_Command('viewcert');
+	&Print_Certificate_Chain;
+
+	if (!defined($RESULT_OBJ{chain}{correctbundle})) {
+		&Bail('Unable to identify a valid CA bundle.');
+	} else {
+		&Print_Header('CA Bundle:');
+		print qq|$RESULT_OBJ{chain}{correctbundle}{cabundle}\n|;
+		&HR;
+	}
+}
+
+
+#################################################
+##  Generate a CSR or self-signed certificate  ##
+#################################################
+sub API_Gen_CSR_Self {
+	### Check requiured fields ###
+	foreach my $field ('cn','o','l','st','c') {
+		if ($CLI_ARGS{GENERATE}{$field} eq '') { &Bail('Missing '. $CONFIG{config}{x509fields}{$field} . ' (--gen' . $field . ' <BLAH>)'); }
+	}
+
+	### Create request object ###
+	foreach my $field ('cn','o','l','st','c','alt','email','ou','www','bits') { $API_OBJ{$field} = $CLI_ARGS{GENERATE}{$field}; }
+
+	### Send API request ###
+	&Send_API_Command($CONFIG{CMD});
+	&Print_Certificate_Chain;
+}
